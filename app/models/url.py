@@ -17,6 +17,7 @@ class Url(Base):
     short_code = Column(String, unique=True, index=True, nullable=True)
     click_count = Column(Integer, default=0, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)

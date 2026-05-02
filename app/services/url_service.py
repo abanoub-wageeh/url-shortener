@@ -21,6 +21,22 @@ def _short_url(short_code: str) -> str:
     return f"{settings.APP_BASE_URL.rstrip('/')}/{short_code}"
 
 
+def _is_expired(expires_at: datetime | None) -> bool:
+    if expires_at is None:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at <= _utcnow()
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return value
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
 def _url_response(url: Url) -> UrlResponse:
     return UrlResponse(
         id=url.id,
@@ -29,8 +45,9 @@ def _url_response(url: Url) -> UrlResponse:
         short_url=_short_url(url.short_code),
         click_count=url.click_count,
         is_active=url.is_active,
-        created_at=url.created_at,
-        updated_at=url.updated_at,
+        expires_at=_as_utc(url.expires_at),
+        created_at=_as_utc(url.created_at),
+        updated_at=_as_utc(url.updated_at),
     )
 
 
@@ -42,6 +59,7 @@ async def create_url(
     url = Url(
         user_id=current_user.id,
         original_url=str(payload.original_url),
+        expires_at=payload.expires_at,
     )
     db.add(url)
     await db.flush()
@@ -149,6 +167,9 @@ async def resolve_url(short_code: str, db: AsyncSession) -> str:
     )
     url = result.scalar_one_or_none()
     if url is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="URL not found")
+
+    if _is_expired(url.expires_at):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="URL not found")
 
     await _increment_click_count(url.id, db)

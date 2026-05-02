@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -27,10 +27,18 @@ async def create_user(db_session, email="user@example.com", user_name="test_user
 
 
 async def create_short_url(
-    db_session, user, original_url="https://example.com/page", custom_alias=None
+    db_session,
+    user,
+    original_url="https://example.com/page",
+    custom_alias=None,
+    expires_at=None,
 ):
     return await url_service.create_url(
-        CreateUrlRequest(original_url=original_url, custom_alias=custom_alias),
+        CreateUrlRequest(
+            original_url=original_url,
+            custom_alias=custom_alias,
+            expires_at=expires_at,
+        ),
         user,
         db_session,
     )
@@ -57,6 +65,48 @@ async def test_create_url_uses_custom_alias_when_provided(db_session):
     assert response.short_code == "my-alias_123"
     assert response.short_url.endswith("/my-alias_123")
     assert await url_service.resolve_url("my-alias_123", db_session) == response.original_url
+
+
+@pytest.mark.asyncio
+async def test_create_url_stores_future_expiration_date(db_session):
+    user = await create_user(db_session)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=1)
+
+    response = await create_short_url(db_session, user, expires_at=expires_at)
+
+    assert response.expires_at == expires_at
+    assert await url_service.resolve_url(response.short_code, db_session) == response.original_url
+
+
+def test_create_url_request_rejects_past_expiration_date():
+    with pytest.raises(ValidationError):
+        CreateUrlRequest(
+            original_url="https://example.com/page",
+            expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_url_returns_404_for_expired_url_without_incrementing_clicks(
+    db_session,
+):
+    user = await create_user(db_session)
+    created = await create_short_url(
+        db_session,
+        user,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    url = await db_session.get(Url, created.id)
+    url.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await url_service.resolve_url(created.short_code, db_session)
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "URL not found"
+    await db_session.refresh(url)
+    assert url.click_count == 0
 
 
 @pytest.mark.asyncio

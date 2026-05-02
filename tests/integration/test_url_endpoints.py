@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from app.core.security import create_access_token, hash_password
@@ -24,11 +26,17 @@ def auth_headers(user):
 
 
 async def create_url(
-    client, user, original_url="https://example.com/page", custom_alias=None
+    client,
+    user,
+    original_url="https://example.com/page",
+    custom_alias=None,
+    expires_at=None,
 ):
     payload = {"original_url": original_url}
     if custom_alias is not None:
         payload["custom_alias"] = custom_alias
+    if expires_at is not None:
+        payload["expires_at"] = expires_at.isoformat()
 
     response = await client.post(
         "/api/v1/urls",
@@ -100,6 +108,65 @@ async def test_create_url_with_custom_alias_redirects_using_alias(client, db_ses
     redirect_response = await client.get("/my-link_123", follow_redirects=False)
     assert redirect_response.status_code == 302
     assert redirect_response.headers["location"] == "https://example.com/page"
+
+
+@pytest.mark.asyncio
+async def test_create_url_with_future_expiration_date(client, db_session):
+    user = await create_user(db_session)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=1)
+
+    created = await create_url(client, user, expires_at=expires_at)
+
+    assert created["expires_at"] is not None
+    assert created["expires_at"].startswith(expires_at.date().isoformat())
+
+    redirect_response = await client.get(f"/{created['short_code']}", follow_redirects=False)
+    assert redirect_response.status_code == 302
+
+    list_response = await client.get("/api/v1/urls", headers=auth_headers(user))
+    assert list_response.status_code == 200
+    assert list_response.json()["items"][0]["expires_at"] == created["expires_at"]
+
+
+@pytest.mark.asyncio
+async def test_create_url_rejects_past_expiration_date(client, db_session):
+    user = await create_user(db_session)
+
+    response = await client.post(
+        "/api/v1/urls",
+        headers=auth_headers(user),
+        json={
+            "original_url": "https://example.com",
+            "expires_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_expired_url_returns_404_and_stays_listed(client, db_session):
+    user = await create_user(db_session)
+    created = await create_url(
+        client,
+        user,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    url = await db_session.get(Url, created["id"])
+    url.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    await db_session.commit()
+
+    redirect_response = await client.get(f"/{created['short_code']}", follow_redirects=False)
+    assert redirect_response.status_code == 404
+    assert redirect_response.json()["detail"] == "URL not found"
+
+    await db_session.refresh(url)
+    assert url.click_count == 0
+
+    list_response = await client.get("/api/v1/urls", headers=auth_headers(user))
+    assert list_response.status_code == 200
+    assert list_response.json()["total"] == 1
+    assert list_response.json()["items"][0]["expires_at"] is not None
 
 
 @pytest.mark.asyncio

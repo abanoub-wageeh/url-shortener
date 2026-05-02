@@ -1,5 +1,5 @@
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator
 
@@ -14,12 +14,14 @@ class CreateUrlRequest(BaseModel):
             "example": {
                 "original_url": "https://example.com/page",
                 "custom_alias": "my-link",
+                "expires_at": "2026-06-01T00:00:00Z",
             }
         }
     )
 
     original_url: AnyHttpUrl = Field(max_length=2048)
     custom_alias: str | None = Field(default=None, min_length=3, max_length=64)
+    expires_at: datetime | None = None
 
     @field_validator("custom_alias", mode="before")
     @classmethod
@@ -34,6 +36,20 @@ class CreateUrlRequest(BaseModel):
             raise ValueError(
                 "Custom alias can contain letters, numbers, underscores, and hyphens only"
             )
+
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expires_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return value
+
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+
+        if value <= datetime.now(timezone.utc):
+            raise ValueError("Expiration date must be in the future")
 
         return value
 
@@ -54,6 +70,7 @@ class UrlResponse(BaseModel):
                 "short_url": "http://localhost:8000/1",
                 "click_count": 0,
                 "is_active": True,
+                "expires_at": "2026-06-01T00:00:00Z",
                 "created_at": "2026-05-02T19:30:00Z",
                 "updated_at": "2026-05-02T19:30:00Z",
             }
@@ -66,6 +83,7 @@ class UrlResponse(BaseModel):
     short_url: str
     click_count: int
     is_active: bool
+    expires_at: datetime | None
     created_at: datetime | None
     updated_at: datetime | None
 
