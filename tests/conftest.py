@@ -15,7 +15,8 @@ from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
 
-# Import the model so SQLAlchemy metadata includes the users table.
+# Import the models so SQLAlchemy metadata includes their tables.
+from app.models.url import Url
 from app.models.user import User
 
 
@@ -61,4 +62,4 @@ async def client(db_session_factory):
     app.dependency_overrides.clear()
 
 
-__all__ = ["User"]
+__all__ = ["Url", "User"]

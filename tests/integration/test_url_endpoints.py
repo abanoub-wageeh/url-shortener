@@ -1,0 +1,221 @@
+import pytest
+
+from app.core.security import create_access_token, hash_password
+from app.models.url import Url
+from app.models.user import User
+
+
+async def create_user(db_session, email="user@example.com", user_name="test_user"):
+    user = User(
+        name="Test User",
+        user_name=user_name,
+        email=email,
+        hashed_password=hash_password("secret123"),
+        is_email_verified=True,
+    )
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+    return user
+
+
+def auth_headers(user):
+    return {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+
+async def create_url(client, user, original_url="https://example.com/page"):
+    response = await client.post(
+        "/api/v1/urls",
+        headers=auth_headers(user),
+        json={"original_url": original_url},
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+@pytest.mark.asyncio
+async def test_create_list_redirect_and_click_count_flow(client, db_session):
+    user = await create_user(db_session)
+
+    created = await create_url(client, user, "https://example.com/docs")
+
+    assert created["short_code"] == "1"
+    assert created["short_url"].endswith("/1")
+    assert created["click_count"] == 0
+    assert created["is_active"] is True
+
+    list_response = await client.get(
+        "/api/v1/urls?page=1&limit=20", headers=auth_headers(user)
+    )
+    assert list_response.status_code == 200
+    list_body = list_response.json()
+    assert list_body["total"] == 1
+    assert list_body["page"] == 1
+    assert list_body["limit"] == 20
+    assert list_body["pages"] == 1
+    assert list_body["items"][0]["short_code"] == created["short_code"]
+
+    redirect_response = await client.get(f"/{created['short_code']}", follow_redirects=False)
+    assert redirect_response.status_code == 302
+    assert redirect_response.headers["location"] == "https://example.com/docs"
+
+    url = await db_session.get(Url, created["id"])
+    await db_session.refresh(url)
+    assert url.click_count == 1
+
+
+@pytest.mark.asyncio
+async def test_list_urls_uses_page_pagination(client, db_session):
+    user = await create_user(db_session)
+    first = await create_url(client, user, "https://example.com/1")
+    second = await create_url(client, user, "https://example.com/2")
+    third = await create_url(client, user, "https://example.com/3")
+
+    page_one = await client.get("/api/v1/urls?page=1&limit=2", headers=auth_headers(user))
+    assert page_one.status_code == 200
+    assert page_one.json()["total"] == 3
+    assert page_one.json()["pages"] == 2
+    assert [item["id"] for item in page_one.json()["items"]] == [third["id"], second["id"]]
+
+    page_two = await client.get("/api/v1/urls?page=2&limit=2", headers=auth_headers(user))
+    assert page_two.status_code == 200
+    assert [item["id"] for item in page_two.json()["items"]] == [first["id"]]
+
+
+@pytest.mark.asyncio
+async def test_update_url_status_disables_and_activates_url(client, db_session):
+    user = await create_user(db_session)
+    created = await create_url(client, user)
+
+    disable_response = await client.patch(
+        f"/api/v1/urls/{created['id']}/status",
+        headers=auth_headers(user),
+        json={"is_active": False},
+    )
+    assert disable_response.status_code == 200
+    assert disable_response.json() == {"message": "URL disabled successfully"}
+
+    redirect_response = await client.get(f"/{created['short_code']}", follow_redirects=False)
+    assert redirect_response.status_code == 404
+    assert redirect_response.json()["detail"] == "URL not found"
+
+    list_response = await client.get("/api/v1/urls", headers=auth_headers(user))
+    assert list_response.status_code == 200
+    assert list_response.json()["total"] == 1
+    assert list_response.json()["items"][0]["is_active"] is False
+
+    url = await db_session.get(Url, created["id"])
+    await db_session.refresh(url)
+    assert url.is_active is False
+    assert url.deleted_at is None
+
+    activate_response = await client.patch(
+        f"/api/v1/urls/{created['id']}/status",
+        headers=auth_headers(user),
+        json={"is_active": True},
+    )
+    assert activate_response.status_code == 200
+    assert activate_response.json() == {"message": "URL activated successfully"}
+
+    redirect_response = await client.get(f"/{created['short_code']}", follow_redirects=False)
+    assert redirect_response.status_code == 302
+    assert redirect_response.headers["location"] == "https://example.com/page"
+
+
+@pytest.mark.asyncio
+async def test_delete_url_soft_deletes_and_hides_it(client, db_session):
+    user = await create_user(db_session)
+    created = await create_url(client, user)
+
+    delete_response = await client.delete(
+        f"/api/v1/urls/{created['id']}", headers=auth_headers(user)
+    )
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {"message": "URL deleted successfully"}
+
+    list_response = await client.get("/api/v1/urls", headers=auth_headers(user))
+    assert list_response.status_code == 200
+    assert list_response.json()["total"] == 0
+
+    redirect_response = await client.get(f"/{created['short_code']}", follow_redirects=False)
+    assert redirect_response.status_code == 404
+
+    url = await db_session.get(Url, created["id"])
+    await db_session.refresh(url)
+    assert url.is_active is False
+    assert url.deleted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_url_endpoints_require_authentication(client):
+    create_response = await client.post(
+        "/api/v1/urls", json={"original_url": "https://example.com"}
+    )
+    assert create_response.status_code == 401
+
+    list_response = await client.get("/api/v1/urls")
+    assert list_response.status_code == 401
+
+    status_response = await client.patch("/api/v1/urls/1/status", json={"is_active": False})
+    assert status_response.status_code == 401
+
+    delete_response = await client.delete("/api/v1/urls/1")
+    assert delete_response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_user_cannot_update_status_or_delete_another_users_url(client, db_session):
+    owner = await create_user(db_session)
+    other_user = await create_user(
+        db_session, email="other@example.com", user_name="other_user"
+    )
+    created = await create_url(client, owner)
+
+    disable_response = await client.patch(
+        f"/api/v1/urls/{created['id']}/status",
+        headers=auth_headers(other_user),
+        json={"is_active": False},
+    )
+    assert disable_response.status_code == 404
+    assert disable_response.json()["detail"] == "URL not found"
+
+    delete_response = await client.delete(
+        f"/api/v1/urls/{created['id']}", headers=auth_headers(other_user)
+    )
+    assert delete_response.status_code == 404
+    assert delete_response.json()["detail"] == "URL not found"
+
+    redirect_response = await client.get(f"/{created['short_code']}", follow_redirects=False)
+    assert redirect_response.status_code == 302
+
+
+@pytest.mark.asyncio
+async def test_deleted_url_cannot_be_activated(client, db_session):
+    user = await create_user(db_session)
+    created = await create_url(client, user)
+
+    delete_response = await client.delete(
+        f"/api/v1/urls/{created['id']}", headers=auth_headers(user)
+    )
+    assert delete_response.status_code == 200
+
+    activate_response = await client.patch(
+        f"/api/v1/urls/{created['id']}/status",
+        headers=auth_headers(user),
+        json={"is_active": True},
+    )
+    assert activate_response.status_code == 404
+    assert activate_response.json()["detail"] == "URL not found"
+
+
+@pytest.mark.asyncio
+async def test_create_url_validates_original_url(client, db_session):
+    user = await create_user(db_session)
+
+    response = await client.post(
+        "/api/v1/urls",
+        headers=auth_headers(user),
+        json={"original_url": "not-a-url"},
+    )
+
+    assert response.status_code == 422

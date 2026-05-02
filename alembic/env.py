@@ -19,6 +19,7 @@ if config.config_file_name is not None:
 # add your model's MetaData object here
 from app.db.base import Base
 from app.models import user
+from app.models import url
 from app.core.config import settings
 
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
