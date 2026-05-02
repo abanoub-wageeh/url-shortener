@@ -9,3 +9,7 @@ alembic
 pyjwt
 pwdlib[argon2]
 pydantic[email]
+pytest
+pytest-asyncio
+httpx
+aiosqlite
