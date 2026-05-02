@@ -6,3 +6,5 @@ pydantic_settings
 asyncpg
 psycopg2-binary
 alembic
+pyjwt
+pwdlib[argon2]
