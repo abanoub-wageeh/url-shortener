@@ -23,11 +23,17 @@ def auth_headers(user):
     return {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
 
 
-async def create_url(client, user, original_url="https://example.com/page"):
+async def create_url(
+    client, user, original_url="https://example.com/page", custom_alias=None
+):
+    payload = {"original_url": original_url}
+    if custom_alias is not None:
+        payload["custom_alias"] = custom_alias
+
     response = await client.post(
         "/api/v1/urls",
         headers=auth_headers(user),
-        json={"original_url": original_url},
+        json=payload,
     )
     assert response.status_code == 201
     return response.json()
@@ -80,6 +86,83 @@ async def test_list_urls_uses_page_pagination(client, db_session):
     page_two = await client.get("/api/v1/urls?page=2&limit=2", headers=auth_headers(user))
     assert page_two.status_code == 200
     assert [item["id"] for item in page_two.json()["items"]] == [first["id"]]
+
+
+@pytest.mark.asyncio
+async def test_create_url_with_custom_alias_redirects_using_alias(client, db_session):
+    user = await create_user(db_session)
+
+    created = await create_url(client, user, custom_alias="my-link_123")
+
+    assert created["short_code"] == "my-link_123"
+    assert created["short_url"].endswith("/my-link_123")
+
+    redirect_response = await client.get("/my-link_123", follow_redirects=False)
+    assert redirect_response.status_code == 302
+    assert redirect_response.headers["location"] == "https://example.com/page"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_custom_alias_returns_409(client, db_session):
+    user = await create_user(db_session)
+    other_user = await create_user(
+        db_session, email="other@example.com", user_name="other_user"
+    )
+    await create_url(client, user, custom_alias="shared-alias")
+
+    response = await client.post(
+        "/api/v1/urls",
+        headers=auth_headers(other_user),
+        json={
+            "original_url": "https://example.com/other",
+            "custom_alias": "shared-alias",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Short code already exists"
+
+
+@pytest.mark.asyncio
+async def test_soft_deleted_custom_alias_cannot_be_reused(client, db_session):
+    user = await create_user(db_session)
+    created = await create_url(client, user, custom_alias="keep-reserved")
+
+    delete_response = await client.delete(
+        f"/api/v1/urls/{created['id']}", headers=auth_headers(user)
+    )
+    assert delete_response.status_code == 200
+
+    response = await client.post(
+        "/api/v1/urls",
+        headers=auth_headers(user),
+        json={
+            "original_url": "https://example.com/reuse",
+            "custom_alias": "keep-reserved",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Short code already exists"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "custom_alias",
+    ["api", "docs", "bad alias", "bad.alias", "ab", ""],
+)
+async def test_create_url_rejects_invalid_or_reserved_custom_alias(
+    client, db_session, custom_alias
+):
+    user = await create_user(db_session)
+
+    response = await client.post(
+        "/api/v1/urls",
+        headers=auth_headers(user),
+        json={"original_url": "https://example.com", "custom_alias": custom_alias},
+    )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

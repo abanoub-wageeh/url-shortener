@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.base62 import encode_base62
@@ -45,9 +46,17 @@ async def create_url(
     db.add(url)
     await db.flush()
 
-    url.short_code = encode_base62(url.id)
-    await db.commit()
-    await db.refresh(url)
+    url.short_code = payload.custom_alias or encode_base62(url.id)
+
+    try:
+        await db.commit()
+        await db.refresh(url)
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Short code already exists",
+        ) from exc
 
     return _url_response(url)
 

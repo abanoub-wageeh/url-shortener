@@ -1,14 +1,41 @@
+import re
 from datetime import datetime
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator
+
+
+CUSTOM_ALIAS_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+RESERVED_ALIASES = {"api", "docs", "redoc", "openapi.json"}
 
 
 class CreateUrlRequest(BaseModel):
     model_config = ConfigDict(
-        json_schema_extra={"example": {"original_url": "https://example.com/page"}}
+        json_schema_extra={
+            "example": {
+                "original_url": "https://example.com/page",
+                "custom_alias": "my-link",
+            }
+        }
     )
 
     original_url: AnyHttpUrl = Field(max_length=2048)
+    custom_alias: str | None = Field(default=None, min_length=3, max_length=64)
+
+    @field_validator("custom_alias", mode="before")
+    @classmethod
+    def validate_custom_alias(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+
+        value = value.strip()
+        if value.lower() in RESERVED_ALIASES:
+            raise ValueError("Custom alias is reserved")
+        if not CUSTOM_ALIAS_PATTERN.fullmatch(value):
+            raise ValueError(
+                "Custom alias can contain letters, numbers, underscores, and hyphens only"
+            )
+
+        return value
 
 
 class UpdateUrlStatusRequest(BaseModel):
