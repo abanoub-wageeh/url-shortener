@@ -8,7 +8,7 @@ from app.core.base62 import encode_base62
 from app.core.security import hash_password
 from app.models.url import Url
 from app.models.user import User
-from app.schemas.url import CreateUrlRequest
+from app.schemas.url import CreateUrlRequest, UpdateUrlRequest
 from app.services import url_service
 
 
@@ -169,6 +169,151 @@ async def test_list_urls_uses_page_pagination_and_excludes_deleted(db_session):
 
     response = await url_service.list_urls(user, page=2, limit=2, db=db_session)
     assert [item.id for item in response.items] == [third.id, second.id]
+
+
+@pytest.mark.asyncio
+async def test_get_url_returns_owned_url(db_session):
+    user = await create_user(db_session)
+    created = await create_short_url(db_session, user, custom_alias="owned-alias")
+
+    response = await url_service.get_url(created.id, user, db_session)
+
+    assert response.id == created.id
+    assert response.original_url == "https://example.com/page"
+    assert response.short_code == "owned-alias"
+
+
+@pytest.mark.asyncio
+async def test_get_url_returns_404_for_another_user_or_deleted_url(db_session):
+    owner = await create_user(db_session)
+    other_user = await create_user(
+        db_session, email="other@example.com", user_name="other_user"
+    )
+    created = await create_short_url(db_session, owner)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await url_service.get_url(created.id, other_user, db_session)
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "URL not found"
+
+    await url_service.delete_url(created.id, owner, db_session)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await url_service.get_url(created.id, owner, db_session)
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "URL not found"
+
+
+@pytest.mark.asyncio
+async def test_update_url_changes_original_url_alias_and_expiration(db_session):
+    user = await create_user(db_session)
+    created = await create_short_url(db_session, user, custom_alias="old-alias")
+    expires_at = datetime.now(timezone.utc) + timedelta(days=2)
+
+    response = await url_service.update_url(
+        created.id,
+        UpdateUrlRequest(
+            original_url="https://example.com/updated",
+            custom_alias="new-alias",
+            expires_at=expires_at,
+        ),
+        user,
+        db_session,
+    )
+
+    assert response.id == created.id
+    assert response.original_url == "https://example.com/updated"
+    assert response.short_code == "new-alias"
+    assert response.expires_at == expires_at
+
+    with pytest.raises(HTTPException) as exc_info:
+        await url_service.resolve_url("old-alias", db_session)
+
+    assert exc_info.value.status_code == 404
+    assert await url_service.resolve_url("new-alias", db_session) == "https://example.com/updated"
+
+
+@pytest.mark.asyncio
+async def test_update_url_supports_partial_update_and_clears_expiration(db_session):
+    user = await create_user(db_session)
+    created = await create_short_url(
+        db_session,
+        user,
+        custom_alias="partial-alias",
+        expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+
+    response = await url_service.update_url(
+        created.id,
+        UpdateUrlRequest(expires_at=None),
+        user,
+        db_session,
+    )
+
+    assert response.original_url == created.original_url
+    assert response.short_code == "partial-alias"
+    assert response.expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_update_url_returns_404_for_another_user_or_deleted_url(db_session):
+    owner = await create_user(db_session)
+    other_user = await create_user(
+        db_session, email="other@example.com", user_name="other_user"
+    )
+    created = await create_short_url(db_session, owner)
+    payload = UpdateUrlRequest(original_url="https://example.com/updated")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await url_service.update_url(created.id, payload, other_user, db_session)
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "URL not found"
+
+    await url_service.delete_url(created.id, owner, db_session)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await url_service.update_url(created.id, payload, owner, db_session)
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "URL not found"
+
+
+@pytest.mark.asyncio
+async def test_update_url_returns_409_for_duplicate_custom_alias(db_session):
+    user = await create_user(db_session)
+    first = await create_short_url(db_session, user, custom_alias="taken-alias")
+    second = await create_short_url(db_session, user, custom_alias="second-alias")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await url_service.update_url(
+            second.id,
+            UpdateUrlRequest(custom_alias=first.short_code),
+            user,
+            db_session,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "Short code already exists"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"original_url": "not-a-url"},
+        {"original_url": None},
+        {"custom_alias": None},
+        {"custom_alias": "api"},
+        {"custom_alias": "bad alias"},
+        {"expires_at": datetime.now(timezone.utc) - timedelta(seconds=1)},
+    ],
+)
+def test_update_url_request_rejects_invalid_payloads(payload):
+    with pytest.raises(ValidationError):
+        UpdateUrlRequest(**payload)
 
 
 @pytest.mark.asyncio

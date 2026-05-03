@@ -10,7 +10,7 @@ from app.core.config import settings
 from app.models.url import Url
 from app.models.user import User
 from app.schemas.auth import MessageResponse
-from app.schemas.url import CreateUrlRequest, UrlListResponse, UrlResponse
+from app.schemas.url import CreateUrlRequest, UpdateUrlRequest, UrlListResponse, UrlResponse
 
 
 def _utcnow() -> datetime:
@@ -49,6 +49,20 @@ def _url_response(url: Url) -> UrlResponse:
         created_at=_as_utc(url.created_at),
         updated_at=_as_utc(url.updated_at),
     )
+
+
+async def _get_owned_url(url_id: int, current_user: User, db: AsyncSession) -> Url:
+    result = await db.execute(
+        select(Url).where(
+            Url.id == url_id,
+            Url.user_id == current_user.id,
+            Url.deleted_at.is_(None),
+        )
+    )
+    url = result.scalar_one_or_none()
+    if url is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="URL not found")
+    return url
 
 
 async def create_url(
@@ -110,21 +124,49 @@ async def list_urls(
     )
 
 
+async def get_url(
+    url_id: int,
+    current_user: User,
+    db: AsyncSession,
+) -> UrlResponse:
+    url = await _get_owned_url(url_id, current_user, db)
+    return _url_response(url)
+
+
+async def update_url(
+    url_id: int,
+    payload: UpdateUrlRequest,
+    current_user: User,
+    db: AsyncSession,
+) -> UrlResponse:
+    url = await _get_owned_url(url_id, current_user, db)
+
+    if "original_url" in payload.model_fields_set:
+        url.original_url = str(payload.original_url)
+    if "custom_alias" in payload.model_fields_set:
+        url.short_code = payload.custom_alias
+    if "expires_at" in payload.model_fields_set:
+        url.expires_at = payload.expires_at
+
+    try:
+        await db.commit()
+        await db.refresh(url)
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Short code already exists",
+        ) from exc
+
+    return _url_response(url)
+
+
 async def delete_url(
     url_id: int,
     current_user: User,
     db: AsyncSession,
 ) -> MessageResponse:
-    result = await db.execute(
-        select(Url).where(
-            Url.id == url_id,
-            Url.user_id == current_user.id,
-            Url.deleted_at.is_(None),
-        )
-    )
-    url = result.scalar_one_or_none()
-    if url is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="URL not found")
+    url = await _get_owned_url(url_id, current_user, db)
 
     url.is_active = False
     url.deleted_at = _utcnow()
@@ -139,16 +181,7 @@ async def update_url_status(
     current_user: User,
     db: AsyncSession,
 ) -> MessageResponse:
-    result = await db.execute(
-        select(Url).where(
-            Url.id == url_id,
-            Url.user_id == current_user.id,
-            Url.deleted_at.is_(None),
-        )
-    )
-    url = result.scalar_one_or_none()
-    if url is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="URL not found")
+    url = await _get_owned_url(url_id, current_user, db)
 
     url.is_active = is_active
     await db.commit()

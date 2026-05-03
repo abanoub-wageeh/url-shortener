@@ -7,6 +7,7 @@ from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.url import (
     CreateUrlRequest,
+    UpdateUrlRequest,
     UpdateUrlStatusRequest,
     UrlListResponse,
     UrlResponse,
@@ -33,6 +34,25 @@ async def list_urls(
     db: AsyncSession = Depends(get_db),
 ) -> UrlListResponse:
     return await url_service.list_urls(current_user, page, limit, db)
+
+
+@router.get("/{url_id}", response_model=UrlResponse)
+async def get_url(
+    url_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> UrlResponse:
+    return await url_service.get_url(url_id, current_user, db)
+
+
+@router.patch("/{url_id}", response_model=UrlResponse)
+async def update_url(
+    url_id: int,
+    payload: UpdateUrlRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> UrlResponse:
+    return await url_service.update_url(url_id, payload, current_user, db)
 
 
 @router.delete("/{url_id}", response_model=MessageResponse)

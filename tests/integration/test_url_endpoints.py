@@ -102,6 +102,187 @@ async def test_list_urls_uses_page_pagination(client, db_session):
 
 
 @pytest.mark.asyncio
+async def test_get_url_returns_owned_url(client, db_session):
+    user = await create_user(db_session)
+    created = await create_url(client, user, custom_alias="owned-link")
+
+    response = await client.get(
+        f"/api/v1/urls/{created['id']}",
+        headers=auth_headers(user),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == created["id"]
+    assert body["original_url"] == "https://example.com/page"
+    assert body["short_code"] == "owned-link"
+    assert body["short_url"].endswith("/owned-link")
+
+
+@pytest.mark.asyncio
+async def test_get_url_returns_404_for_another_users_url(client, db_session):
+    owner = await create_user(db_session)
+    other_user = await create_user(
+        db_session, email="other@example.com", user_name="other_user"
+    )
+    created = await create_url(client, owner)
+
+    response = await client.get(
+        f"/api/v1/urls/{created['id']}",
+        headers=auth_headers(other_user),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "URL not found"
+
+
+@pytest.mark.asyncio
+async def test_get_url_returns_404_for_deleted_url(client, db_session):
+    user = await create_user(db_session)
+    created = await create_url(client, user)
+    await client.delete(f"/api/v1/urls/{created['id']}", headers=auth_headers(user))
+
+    response = await client.get(
+        f"/api/v1/urls/{created['id']}",
+        headers=auth_headers(user),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "URL not found"
+
+
+@pytest.mark.asyncio
+async def test_update_url_updates_original_url_alias_and_expiration(client, db_session):
+    user = await create_user(db_session)
+    created = await create_url(client, user, custom_alias="old-alias")
+    expires_at = datetime.now(timezone.utc) + timedelta(days=3)
+
+    response = await client.patch(
+        f"/api/v1/urls/{created['id']}",
+        headers=auth_headers(user),
+        json={
+            "original_url": "https://example.com/updated",
+            "custom_alias": "new-alias",
+            "expires_at": expires_at.isoformat(),
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == created["id"]
+    assert body["original_url"] == "https://example.com/updated"
+    assert body["short_code"] == "new-alias"
+    assert body["short_url"].endswith("/new-alias")
+    assert body["expires_at"] is not None
+
+    old_redirect = await client.get("/old-alias", follow_redirects=False)
+    assert old_redirect.status_code == 404
+
+    new_redirect = await client.get("/new-alias", follow_redirects=False)
+    assert new_redirect.status_code == 302
+    assert new_redirect.headers["location"] == "https://example.com/updated"
+
+
+@pytest.mark.asyncio
+async def test_update_url_supports_partial_update_and_clears_expiration(client, db_session):
+    user = await create_user(db_session)
+    created = await create_url(
+        client,
+        user,
+        custom_alias="partial-alias",
+        expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+
+    response = await client.patch(
+        f"/api/v1/urls/{created['id']}",
+        headers=auth_headers(user),
+        json={"expires_at": None},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["original_url"] == created["original_url"]
+    assert body["short_code"] == "partial-alias"
+    assert body["expires_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_update_url_returns_404_for_another_users_url(client, db_session):
+    owner = await create_user(db_session)
+    other_user = await create_user(
+        db_session, email="other@example.com", user_name="other_user"
+    )
+    created = await create_url(client, owner)
+
+    response = await client.patch(
+        f"/api/v1/urls/{created['id']}",
+        headers=auth_headers(other_user),
+        json={"original_url": "https://example.com/hijack"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "URL not found"
+
+
+@pytest.mark.asyncio
+async def test_update_url_returns_404_for_deleted_url(client, db_session):
+    user = await create_user(db_session)
+    created = await create_url(client, user)
+    await client.delete(f"/api/v1/urls/{created['id']}", headers=auth_headers(user))
+
+    response = await client.patch(
+        f"/api/v1/urls/{created['id']}",
+        headers=auth_headers(user),
+        json={"original_url": "https://example.com/deleted"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "URL not found"
+
+
+@pytest.mark.asyncio
+async def test_update_url_returns_409_for_duplicate_custom_alias(client, db_session):
+    user = await create_user(db_session)
+    first = await create_url(client, user, custom_alias="taken-alias")
+    second = await create_url(client, user, custom_alias="second-alias")
+
+    response = await client.patch(
+        f"/api/v1/urls/{second['id']}",
+        headers=auth_headers(user),
+        json={"custom_alias": first["short_code"]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Short code already exists"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"original_url": "not-a-url"},
+        {"original_url": None},
+        {"custom_alias": None},
+        {"custom_alias": "api"},
+        {"custom_alias": "bad alias"},
+        {"expires_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()},
+    ],
+)
+async def test_update_url_rejects_invalid_payloads(client, db_session, payload):
+    user = await create_user(db_session)
+    created = await create_url(client, user)
+
+    response = await client.patch(
+        f"/api/v1/urls/{created['id']}",
+        headers=auth_headers(user),
+        json=payload,
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_create_url_with_custom_alias_redirects_using_alias(client, db_session):
     user = await create_user(db_session)
 
@@ -310,6 +491,15 @@ async def test_url_endpoints_require_authentication(client):
 
     list_response = await client.get("/api/v1/urls")
     assert list_response.status_code == 401
+
+    get_response = await client.get("/api/v1/urls/1")
+    assert get_response.status_code == 401
+
+    update_response = await client.patch(
+        "/api/v1/urls/1",
+        json={"original_url": "https://example.com/updated"},
+    )
+    assert update_response.status_code == 401
 
     status_response = await client.patch("/api/v1/urls/1/status", json={"is_active": False})
     assert status_response.status_code == 401
