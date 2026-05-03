@@ -7,13 +7,18 @@ from app.models.url import Url
 from app.models.user import User
 
 
-async def create_user(db_session, email="user@example.com", user_name="test_user"):
+async def create_user(
+    db_session,
+    email="user@example.com",
+    user_name="test_user",
+    is_email_verified=True,
+):
     user = User(
         name="Test User",
         user_name=user_name,
         email=email,
         hashed_password=hash_password("secret123"),
-        is_email_verified=True,
+        is_email_verified=is_email_verified,
     )
     db_session.add(user)
     await db_session.commit()
@@ -311,6 +316,25 @@ async def test_url_endpoints_require_authentication(client):
 
     delete_response = await client.delete("/api/v1/urls/1")
     assert delete_response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_url_endpoints_reject_unverified_user_token(client, db_session):
+    user = await create_user(
+        db_session,
+        email="unverified@example.com",
+        user_name="unverified_user",
+        is_email_verified=False,
+    )
+
+    response = await client.post(
+        "/api/v1/urls",
+        headers=auth_headers(user),
+        json={"original_url": "https://example.com"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Verify your email before continuing"
 
 
 @pytest.mark.asyncio

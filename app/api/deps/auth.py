@@ -28,6 +28,12 @@ async def get_current_user(
     if user is None:
         raise _credentials_exception()
 
+    if not user.is_email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Verify your email before continuing",
+        )
+
     return user
 
 

@@ -2,7 +2,7 @@ from sqlalchemy import select
 
 import pytest
 
-from app.core.security import hash_password
+from app.core.security import create_access_token, hash_password
 from app.models.user import User
 from app.services import auth_service
 
@@ -130,6 +130,28 @@ async def test_change_password_updates_credentials(client, monkeypatch):
         json={"identifier": "change_user", "password": "newsecret123"},
     )
     assert new_login_response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_protected_auth_endpoint_rejects_unverified_user_token(client, db_session):
+    user = User(
+        name="Unverified User",
+        user_name="unverified_user",
+        email="unverified@example.com",
+        hashed_password=hash_password("secret123"),
+        is_email_verified=False,
+    )
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    response = await client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {create_access_token(str(user.id))}"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Verify your email before continuing"
 
 
 @pytest.mark.asyncio
