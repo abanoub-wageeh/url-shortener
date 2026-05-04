@@ -4,6 +4,9 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     APP_BASE_URL: str = "http://localhost:8000"
     FRONTEND_RESET_PASSWORD_URL: str | None = None
+    REDIS_URL: str = "redis://localhost:6379/0"
+    REDIRECT_CACHE_ENABLED: bool = True
+    REDIRECT_CACHE_TTL_SECONDS: int = 300
     SECRET_KEY: str
     JWT_ALGORITHM: str
     ACCESS_TOKEN_EXPIRE_MINUTES: int

@@ -2,7 +2,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.api.v1.endpoints.redirects import get_redis as get_redirect_redis
+from app.api.v1.endpoints.urls import get_redis as get_urls_redis
 from app.core.security import create_access_token, hash_password
+from app.main import app
 from app.models.url import Url
 from app.models.user import User
 
@@ -28,6 +31,45 @@ async def create_user(
 
 def auth_headers(user):
     return {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+
+class FakeRedis:
+    def __init__(self):
+        self.store = {}
+        self.get_calls = []
+        self.setex_calls = []
+        self.delete_calls = []
+
+    async def get(self, key):
+        self.get_calls.append(key)
+        return self.store.get(key)
+
+    async def setex(self, key, ttl, value):
+        self.setex_calls.append((key, ttl, value))
+        self.store[key] = value
+
+    async def delete(self, key):
+        self.delete_calls.append(key)
+        self.store.pop(key, None)
+
+
+class FailingRedis:
+    async def get(self, key):
+        raise RuntimeError("Redis get failed")
+
+    async def setex(self, key, ttl, value):
+        raise RuntimeError("Redis set failed")
+
+    async def delete(self, key):
+        raise RuntimeError("Redis delete failed")
+
+
+def use_fake_redis(fake_redis):
+    async def override_get_redis():
+        yield fake_redis
+
+    app.dependency_overrides[get_redirect_redis] = override_get_redis
+    app.dependency_overrides[get_urls_redis] = override_get_redis
 
 
 async def create_url(
@@ -294,6 +336,155 @@ async def test_create_url_with_custom_alias_redirects_using_alias(client, db_ses
     redirect_response = await client.get("/my-link_123", follow_redirects=False)
     assert redirect_response.status_code == 302
     assert redirect_response.headers["location"] == "https://example.com/page"
+
+
+@pytest.mark.asyncio
+async def test_redirect_uses_cache_aside_on_cache_miss_and_hit(client, db_session):
+    fake_redis = FakeRedis()
+    use_fake_redis(fake_redis)
+    user = await create_user(db_session)
+    created = await create_url(client, user, custom_alias="cache-link")
+
+    first_response = await client.get("/cache-link", follow_redirects=False)
+
+    assert first_response.status_code == 302
+    assert first_response.headers["location"] == "https://example.com/page"
+    assert fake_redis.get_calls == ["redirect:cache-link"]
+    assert len(fake_redis.setex_calls) == 1
+    assert "redirect:cache-link" in fake_redis.store
+
+    url = await db_session.get(Url, created["id"])
+    url.original_url = "https://example.com/changed-in-db"
+    await db_session.commit()
+
+    second_response = await client.get("/cache-link", follow_redirects=False)
+
+    assert second_response.status_code == 302
+    assert second_response.headers["location"] == "https://example.com/page"
+    assert fake_redis.get_calls == ["redirect:cache-link", "redirect:cache-link"]
+
+    await db_session.refresh(url)
+    assert url.click_count == 2
+
+
+@pytest.mark.asyncio
+async def test_redirect_falls_back_to_database_when_redis_fails(client, db_session):
+    use_fake_redis(FailingRedis())
+    user = await create_user(db_session)
+    created = await create_url(client, user, custom_alias="fallback-link")
+
+    response = await client.get("/fallback-link", follow_redirects=False)
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://example.com/page"
+
+    url = await db_session.get(Url, created["id"])
+    await db_session.refresh(url)
+    assert url.click_count == 1
+
+
+@pytest.mark.asyncio
+async def test_redirect_does_not_cache_expired_url(client, db_session):
+    fake_redis = FakeRedis()
+    use_fake_redis(fake_redis)
+    user = await create_user(db_session)
+    created = await create_url(
+        client,
+        user,
+        custom_alias="expired-cache-link",
+        expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    url = await db_session.get(Url, created["id"])
+    url.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    await db_session.commit()
+
+    response = await client.get("/expired-cache-link", follow_redirects=False)
+
+    assert response.status_code == 404
+    assert fake_redis.setex_calls == []
+    assert "redirect:expired-cache-link" not in fake_redis.store
+
+
+@pytest.mark.asyncio
+async def test_update_url_invalidates_redirect_cache(client, db_session):
+    fake_redis = FakeRedis()
+    use_fake_redis(fake_redis)
+    user = await create_user(db_session)
+    created = await create_url(client, user, custom_alias="update-cache-link")
+    await client.get("/update-cache-link", follow_redirects=False)
+    assert "redirect:update-cache-link" in fake_redis.store
+
+    update_response = await client.patch(
+        f"/api/v1/urls/{created['id']}",
+        headers=auth_headers(user),
+        json={"original_url": "https://example.com/updated-cache"},
+    )
+
+    assert update_response.status_code == 200
+    assert "redirect:update-cache-link" not in fake_redis.store
+    assert fake_redis.delete_calls.count("redirect:update-cache-link") == 2
+
+    redirect_response = await client.get("/update-cache-link", follow_redirects=False)
+    assert redirect_response.status_code == 302
+    assert redirect_response.headers["location"] == "https://example.com/updated-cache"
+
+
+@pytest.mark.asyncio
+async def test_update_url_alias_invalidates_old_and_new_redirect_cache(client, db_session):
+    fake_redis = FakeRedis()
+    use_fake_redis(fake_redis)
+    user = await create_user(db_session)
+    created = await create_url(client, user, custom_alias="old-cache-link")
+    await client.get("/old-cache-link", follow_redirects=False)
+    fake_redis.store["redirect:new-cache-link"] = fake_redis.store["redirect:old-cache-link"]
+
+    update_response = await client.patch(
+        f"/api/v1/urls/{created['id']}",
+        headers=auth_headers(user),
+        json={"custom_alias": "new-cache-link"},
+    )
+
+    assert update_response.status_code == 200
+    assert "redirect:old-cache-link" not in fake_redis.store
+    assert "redirect:new-cache-link" not in fake_redis.store
+
+    old_response = await client.get("/old-cache-link", follow_redirects=False)
+    assert old_response.status_code == 404
+
+    new_response = await client.get("/new-cache-link", follow_redirects=False)
+    assert new_response.status_code == 302
+    assert new_response.headers["location"] == "https://example.com/page"
+
+
+@pytest.mark.asyncio
+async def test_status_update_and_delete_invalidate_redirect_cache(client, db_session):
+    fake_redis = FakeRedis()
+    use_fake_redis(fake_redis)
+    user = await create_user(db_session)
+    status_url = await create_url(client, user, custom_alias="status-cache-link")
+    delete_url = await create_url(client, user, custom_alias="delete-cache-link")
+    await client.get("/status-cache-link", follow_redirects=False)
+    await client.get("/delete-cache-link", follow_redirects=False)
+
+    status_response = await client.patch(
+        f"/api/v1/urls/{status_url['id']}/status",
+        headers=auth_headers(user),
+        json={"is_active": False},
+    )
+    delete_response = await client.delete(
+        f"/api/v1/urls/{delete_url['id']}",
+        headers=auth_headers(user),
+    )
+
+    assert status_response.status_code == 200
+    assert delete_response.status_code == 200
+    assert "redirect:status-cache-link" not in fake_redis.store
+    assert "redirect:delete-cache-link" not in fake_redis.store
+
+    status_redirect = await client.get("/status-cache-link", follow_redirects=False)
+    delete_redirect = await client.get("/delete-cache-link", follow_redirects=False)
+    assert status_redirect.status_code == 404
+    assert delete_redirect.status_code == 404
 
 
 @pytest.mark.asyncio

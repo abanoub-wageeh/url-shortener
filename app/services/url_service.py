@@ -7,10 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.base62 import encode_base62
 from app.core.config import settings
+from app.core.redis import RedisClient
 from app.models.url import Url
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.url import CreateUrlRequest, UpdateUrlRequest, UrlListResponse, UrlResponse
+from app.services import redirect_cache_service
 
 
 def _utcnow() -> datetime:
@@ -63,6 +65,22 @@ async def _get_owned_url(url_id: int, current_user: User, db: AsyncSession) -> U
     if url is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="URL not found")
     return url
+
+
+async def _delete_cached_short_codes(
+    short_codes: set[str | None],
+    redis: RedisClient | None,
+) -> None:
+    if redis is None:
+        return
+
+    for short_code in short_codes:
+        if short_code is None:
+            continue
+        try:
+            await redirect_cache_service.delete_link(short_code, redis)
+        except Exception:
+            pass
 
 
 async def create_url(
@@ -138,8 +156,14 @@ async def update_url(
     payload: UpdateUrlRequest,
     current_user: User,
     db: AsyncSession,
+    redis: RedisClient | None = None,
 ) -> UrlResponse:
     url = await _get_owned_url(url_id, current_user, db)
+    short_codes_to_invalidate = {url.short_code}
+    if "custom_alias" in payload.model_fields_set:
+        short_codes_to_invalidate.add(payload.custom_alias)
+
+    await _delete_cached_short_codes(short_codes_to_invalidate, redis)
 
     if "original_url" in payload.model_fields_set:
         url.original_url = str(payload.original_url)
@@ -153,10 +177,13 @@ async def update_url(
         await db.refresh(url)
     except IntegrityError as exc:
         await db.rollback()
+        await _delete_cached_short_codes(short_codes_to_invalidate, redis)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Short code already exists",
         ) from exc
+
+    await _delete_cached_short_codes(short_codes_to_invalidate, redis)
 
     return _url_response(url)
 
@@ -165,12 +192,16 @@ async def delete_url(
     url_id: int,
     current_user: User,
     db: AsyncSession,
+    redis: RedisClient | None = None,
 ) -> MessageResponse:
     url = await _get_owned_url(url_id, current_user, db)
+    short_codes_to_invalidate = {url.short_code}
+    await _delete_cached_short_codes(short_codes_to_invalidate, redis)
 
     url.is_active = False
     url.deleted_at = _utcnow()
     await db.commit()
+    await _delete_cached_short_codes(short_codes_to_invalidate, redis)
 
     return MessageResponse(message="URL deleted successfully")
 
@@ -180,17 +211,36 @@ async def update_url_status(
     is_active: bool,
     current_user: User,
     db: AsyncSession,
+    redis: RedisClient | None = None,
 ) -> MessageResponse:
     url = await _get_owned_url(url_id, current_user, db)
+    short_codes_to_invalidate = {url.short_code}
+    await _delete_cached_short_codes(short_codes_to_invalidate, redis)
 
     url.is_active = is_active
     await db.commit()
+    await _delete_cached_short_codes(short_codes_to_invalidate, redis)
 
     state = "activated" if is_active else "disabled"
     return MessageResponse(message=f"URL {state} successfully")
 
 
-async def resolve_url(short_code: str, db: AsyncSession) -> str:
+async def resolve_url(
+    short_code: str,
+    db: AsyncSession,
+    redis: RedisClient | None = None,
+) -> str:
+    cached = None
+    if redis is not None:
+        try:
+            cached = await redirect_cache_service.get_link(short_code, redis)
+        except Exception:
+            cached = None
+
+    if cached is not None and not _is_expired(cached.expires_at):
+        await _increment_click_count(cached.url_id, db)
+        return cached.original_url
+
     result = await db.execute(
         select(Url).where(
             Url.short_code == short_code,
@@ -204,6 +254,18 @@ async def resolve_url(short_code: str, db: AsyncSession) -> str:
 
     if _is_expired(url.expires_at):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="URL not found")
+
+    if redis is not None:
+        try:
+            await redirect_cache_service.set_link(
+                url.short_code,
+                url.id,
+                url.original_url,
+                url.expires_at,
+                redis,
+            )
+        except Exception:
+            pass
 
     await _increment_click_count(url.id, db)
     return url.original_url

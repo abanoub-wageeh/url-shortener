@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps.auth import get_current_user
+from app.core.redis import RedisClient, get_redis
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.auth import MessageResponse
@@ -51,8 +52,9 @@ async def update_url(
     payload: UpdateUrlRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    redis: RedisClient | None = Depends(get_redis),
 ) -> UrlResponse:
-    return await url_service.update_url(url_id, payload, current_user, db)
+    return await url_service.update_url(url_id, payload, current_user, db, redis)
 
 
 @router.delete("/{url_id}", response_model=MessageResponse)
@@ -60,8 +62,9 @@ async def delete_url(
     url_id: int,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    redis: RedisClient | None = Depends(get_redis),
 ) -> MessageResponse:
-    return await url_service.delete_url(url_id, current_user, db)
+    return await url_service.delete_url(url_id, current_user, db, redis)
 
 
 @router.patch("/{url_id}/status", response_model=MessageResponse)
@@ -70,5 +73,6 @@ async def update_url_status(
     payload: UpdateUrlStatusRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    redis: RedisClient | None = Depends(get_redis),
 ) -> MessageResponse:
-    return await url_service.update_url_status(url_id, payload.is_active, current_user, db)
+    return await url_service.update_url_status(url_id, payload.is_active, current_user, db, redis)

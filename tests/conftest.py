@@ -5,6 +5,7 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-32-bytes")
 os.environ.setdefault("JWT_ALGORITHM", "HS256")
 os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
 os.environ.setdefault("REFRESH_TOKEN_EXPIRE_DAYS", "7")
+os.environ.setdefault("REDIRECT_CACHE_ENABLED", "false")
 
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
